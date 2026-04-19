@@ -8,6 +8,35 @@
 
 An OpenAI-compatible HTTP proxy that lets [OpenClaw](https://github.com/openclaw/openclaw) agents use Claude through [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) — with tool calling, session memory, and extended thinking.
 
+> **Fork note:** This is a maintained fork of [shinglokto/openclaw-claude-bridge](https://github.com/shinglokto/openclaw-claude-bridge) with stability and robustness improvements cherry-picked from multiple community forks.
+
+---
+
+## What's New in This Fork
+
+Improvements integrated from community forks (Kyzcreig, Patinado, ymat19):
+
+### Reliability & Stability
+- **Channel serialization** — 1 request at a time per channel with a lock queue, preventing duplicate CLI sessions from parallel requests
+- **SSE keepalive** — sends an empty-choices chunk every 15s to prevent OpenClaw idle timeout disconnects
+- **Auto-compact prompt** — if a prompt exceeds 600K chars, it is automatically compacted before sending to Claude CLI
+- **Session purge on error** — broken CLI sessions are purged instead of retrying on corrupted state, preventing cascading failures
+- **Truncate on retry** — if even the compacted prompt is still too large, it is truncated to prevent infinite retry loops
+
+### Tool Handling
+- **Tool call filtering** — filters out hallucinated tool calls that don't exist in the available tools list, with warning logs
+- **Tool profile filtering** — gateway-internal tools are filtered before reaching Claude
+- **Suppress pre-tool text** — in streaming mode, partial assistant prose before tool_calls is suppressed to avoid spurious text during tool loops
+
+### Security
+- **`--strict-mcp-config`** — blocks host MCP servers from leaking into the bridge session, preventing context pollution and reducing token usage
+
+### Diagnostics
+- **Stderr capture** — captures the last 20 stderr lines from Claude CLI for better diagnostics on exit code failures
+- **Error classification** — separate statuses for `idle_timeout`, `hard_timeout`, `cli_exit`, and `oc_disconnect` instead of generic "error"
+- **Usage availability flag** — log entries now indicate whether usage data was actually returned by CLI
+- **Scrub pattern fix** — removed false positive scrubbing of `sessions_*` tool names
+
 ---
 
 ## Why This Exists
@@ -43,7 +72,7 @@ OpenClaw speaks the OpenAI API format. Claude Code CLI speaks its own format. Th
 
 ```bash
 # 1. Clone and install (also builds the dashboard automatically)
-git clone https://github.com/shinglokto/openclaw-claude-bridge.git
+git clone https://github.com/adfdev/openclaw-claude-bridge.git
 cd openclaw-claude-bridge
 npm install
 
@@ -99,7 +128,17 @@ The bridge reads the `tools` array from OpenClaw's request and dynamically gener
 
 This means any new tools added in OpenClaw are automatically available to Claude — no bridge changes needed.
 
-Claude's native tools (Bash, Read, Write, etc.) are disabled via `--tools ""` so it can only call tools through OpenClaw's gateway.
+Claude's native tools (Bash, Read, Write, etc.) are disabled via `--tools ""` so it can only call tools through OpenClaw's gateway. Host MCP servers are blocked via `--strict-mcp-config` to prevent context pollution.
+
+**Tool call validation:** If Claude hallucinates a tool that doesn't exist in the available tools list, the bridge filters it out and logs a warning instead of forwarding the invalid call.
+
+### Channel Serialization
+
+Requests for the same channel are serialized — only one request runs at a time per channel. This prevents race conditions where parallel requests could create duplicate CLI sessions. A lock queue ensures requests are processed in order.
+
+### SSE Keepalive
+
+During long-running requests, the bridge sends an empty-choices SSE chunk every 15 seconds. This prevents OpenClaw's idle timeout from killing the connection while Claude is still thinking.
 
 ### Extended Thinking
 
@@ -113,6 +152,15 @@ The bridge supports Claude's extended thinking via the `reasoning_effort` parame
 | `high` / `xhigh` | `high` | Deep step-by-step |
 
 When `reasoning_effort` is not provided, thinking is disabled entirely (`MAX_THINKING_TOKENS=0`).
+
+### Error Recovery
+
+The bridge has multi-layer error handling:
+
+- **Auto-compact on overflow:** If a prompt is too large for a new session (>600K chars), it is automatically compacted
+- **Retry with compact refresh:** If a resumed CLI session fails, the bridge purges the broken session and retries with compacted history
+- **Truncation safety net:** If even the compacted prompt is too large, it is truncated to prevent infinite loops
+- **Error classification:** Different error types (`idle_timeout`, `hard_timeout`, `cli_exit`, `oc_disconnect`) are tracked separately for better diagnostics
 
 ---
 
@@ -154,8 +202,9 @@ For detailed architecture of the dashboard, see [docs/architecture.md](docs/arch
 | `OPENCLAW_BRIDGE_PORT` | No | `3456` | API server port |
 | `OPENCLAW_BRIDGE_STATUS_PORT` | No | `3458` | Dashboard port |
 | `CLAUDE_BIN` | No | `claude` | Path to Claude Code CLI binary |
-| `MAX_PER_CHANNEL` | No | `2` | Max concurrent requests per channel |
 | `MAX_GLOBAL` | No | `20` | Max concurrent requests globally |
+
+> **Note:** `MAX_PER_CHANNEL` is no longer configurable — channels are serialized (1 request at a time) to prevent session duplication.
 
 ### Ports
 
@@ -266,7 +315,7 @@ openclaw-claude-bridge/
 │   ├── index.js         Entry point, HTTP servers, graceful shutdown
 │   ├── server.js        Request handling, session management, state persistence
 │   ├── claude.js        CLI subprocess, stream parsing, thinking/effort mapping
-│   ├── tools.js         Dynamic tool protocol builder
+│   ├── tools.js         Dynamic tool protocol builder + tool filtering
 │   └── convert.js       OpenAI message format → Claude CLI text format
 ├── dashboard/           React/TypeScript/Tailwind dashboard (Vite)
 │   ├── src/             Components, hooks, lib, types
@@ -289,6 +338,7 @@ openclaw-claude-bridge/
 - **Port 3456** binds to localhost only — not reachable from outside the machine
 - **Port 3458** is LAN-accessible, protected by HTTP Basic Auth when `DASHBOARD_PASS` is set
 - **`--tools ""`** disables all Claude native tools — no host command execution
+- **`--strict-mcp-config`** disables all MCP servers — no host MCP leak into the bridged session
 - **`--dangerously-skip-permissions`** is required for headless operation (no terminal to prompt for confirmation; safe because native tools are disabled)
 - **`.env`** contains secrets and is gitignored
 
@@ -310,6 +360,15 @@ openclaw-claude-bridge/
 | OpenClaw | >= 2026.1 | Gateway on port 18789 |
 
 **Platforms:** macOS (Apple Silicon / Intel), Linux (x64 / ARM)
+
+---
+
+## Credits
+
+Based on [shinglokto/openclaw-claude-bridge](https://github.com/shinglokto/openclaw-claude-bridge). Community improvements from:
+- [Kyzcreig](https://github.com/Kyzcreig/openclaw-claude-bridge) — tool call filtering, MCP isolation, scrub fixes
+- [Patinado](https://github.com/Patinado/openclaw-claude-bridge) — channel serialization, SSE keepalive, error recovery
+- [ymat19](https://github.com/shinglokto/openclaw-claude-bridge/pull/10) — `--strict-mcp-config` PR
 
 ---
 

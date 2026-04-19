@@ -312,11 +312,12 @@ systemctl --user restart openclaw-claude-bridge
 ```
 openclaw-claude-bridge/
 ├── src/
-│   ├── index.js         Entry point, HTTP servers, graceful shutdown
-│   ├── server.js        Request handling, session management, state persistence
-│   ├── claude.js        CLI subprocess, stream parsing, thinking/effort mapping
-│   ├── tools.js         Dynamic tool protocol builder + tool filtering
-│   └── convert.js       OpenAI message format → Claude CLI text format
+│   ├── index.ts         Entry point, HTTP servers, graceful shutdown
+│   ├── server.ts        Request handling, session management, state persistence
+│   ├── claude.ts        CLI subprocess, stream parsing, thinking/effort mapping
+│   ├── tools.ts         Dynamic tool protocol builder + tool filtering
+│   ├── convert.ts       OpenAI message format → Claude CLI text format
+│   └── types.ts         Shared TypeScript type definitions
 ├── dashboard/           React/TypeScript/Tailwind dashboard (Vite)
 │   ├── src/             Components, hooks, lib, types
 │   ├── dist/            Production build (npm run build)

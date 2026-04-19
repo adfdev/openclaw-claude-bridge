@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const { convertMessages, convertMessagesCompact, extractNewMessages, extractNewUserMessages } = require('./convert');
-const { buildToolInstructions } = require('./tools');
+const { buildToolInstructions, filterToolsByProfile } = require('./tools');
 const { runClaude, getContextWindow, clearSessionAlias } = require('./claude');
 
 // --- Session cleanup ---
@@ -153,10 +153,29 @@ const responseMap = new Map();
 // Memory cleanup TTL (not for session lifecycle — just garbage collection)
 const MEMORY_GC_TTL_MS = 60 * 60 * 1000; // 1 hour
 
-// Per-channel concurrent request limit (prevents bug loops while allowing multi-channel usage)
-const MAX_PER_CHANNEL = parseInt(process.env.MAX_PER_CHANNEL) || 2;
+// Max prompt size for new sessions (~150K tokens, safe for 200K context window)
+const MAX_NEW_SESSION_CHARS = 600000;
+
+// Per-channel serialization: only 1 request at a time per channel (prevents session multiplication)
+const MAX_PER_CHANNEL = 1;
 const MAX_GLOBAL = parseInt(process.env.MAX_GLOBAL) || 20;
 const channelActive = new Map(); // channel → count of in-flight requests
+// Per-channel queue: serialize requests to prevent parallel CLI session creation.
+const channelQueues = new Map(); // routingKey → Promise (tail of chain)
+function acquireChannelLock(routingKey) {
+    const prev = channelQueues.get(routingKey) || Promise.resolve();
+    let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    channelQueues.set(routingKey, gate);
+    return prev.then(() => {
+        return () => {
+            release();
+            if (channelQueues.get(routingKey) === gate) {
+                channelQueues.delete(routingKey);
+            }
+        };
+    });
+}
 
 /** First 200 chars of text as a lookup key. */
 function contentKey(text) {
@@ -306,6 +325,22 @@ function parseToolCalls(text) {
     return calls;
 }
 
+function getAvailableToolNames(tools) {
+    if (!Array.isArray(tools)) return [];
+    return tools.map(tool => tool?.function?.name || tool?.name).filter(Boolean);
+}
+
+function filterToolCalls(toolCalls, availableToolNames) {
+    const allowed = new Set(availableToolNames || []);
+    const valid = [];
+    const invalid = [];
+    for (const call of toolCalls || []) {
+        if (allowed.has(call.name)) valid.push(call);
+        else invalid.push(call);
+    }
+    return { valid, invalid };
+}
+
 /**
  * Strip internal XML tags that Claude may echo back from conversation context.
  * These are meant for Claude's consumption, not the end user.
@@ -353,6 +388,8 @@ app.post('/v1/chat/completions', async (req, res) => {
     stats.activeRequests++;
     stats.lastRequestAt = new Date();
     let acquiredChannel = null; // routingKey if channelActive was incremented
+    let releaseChannelLock = null;
+    let keepaliveTimer = null;
 
     console.log(`[${requestId}] POST /v1/chat/completions`);
     // Debug: log OC session identifiers
@@ -470,16 +507,12 @@ app.post('/v1/chat/completions', async (req, res) => {
             logEntry.error = 'Global concurrent limit';
             return res.status(429).json({ error: { message: `Too many concurrent requests (max ${MAX_GLOBAL})`, type: 'rate_limit' } });
         }
+        // Per-channel serialization: wait for previous request on same channel to finish
         if (routingKey) {
-            const active = channelActive.get(routingKey) || 0;
-            if (active >= MAX_PER_CHANNEL) {
-                console.warn(`[${requestId}] BLOCKED: "${routingKey}" has ${active} in-flight (max ${MAX_PER_CHANNEL})`);
-                logEntry.status = 'error';
-                logEntry.error = 'Per-channel concurrent limit';
-                return res.status(429).json({ error: { message: `Too many concurrent requests for this channel (max ${MAX_PER_CHANNEL})`, type: 'rate_limit' } });
-            }
-            channelActive.set(routingKey, active + 1);
+            releaseChannelLock = await acquireChannelLock(routingKey);
+            channelActive.set(routingKey, (channelActive.get(routingKey) || 0) + 1);
             acquiredChannel = routingKey;
+            console.log(`[${requestId}] channel lock acquired: "${routingKey}"`);
         }
 
         // 1) Check channelMap (primary: OC conversation → CLI session)
@@ -567,7 +600,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                 const inToolLoop = extractNewMessages(messages) !== null;
                 if (!inToolLoop) {
                     const compactResult = convertMessagesCompact(messages);
-                    if (compactResult.promptText.length > 1500000) {
+                    if (compactResult.promptText.length > MAX_NEW_SESSION_CHARS) {
                         console.log(`[${requestId}] REFRESH SKIPPED: compact prompt too long (${compactResult.promptText.length})`);
                     } else {
                         const oldSid = entry.sessionId;
@@ -593,7 +626,13 @@ app.post('/v1/chat/completions', async (req, res) => {
 
         // Always build system prompt (not persisted in CLI session)
         const { systemPrompt: devSystemPrompt } = convertMessages(messages);
-        const toolInstructions = buildToolInstructions(tools);
+        const filteredTools = filterToolsByProfile(tools, messages);
+        const toolInstructions = buildToolInstructions(filteredTools);
+        if (filteredTools.length !== tools.length) {
+            const kept = filteredTools.map(t => t.function?.name || t.name).join(',');
+            const dropped = tools.filter(t => !filteredTools.includes(t)).map(t => t.function?.name || t.name).join(',');
+            console.log(`[${requestId}] tool profile: ${filteredTools.length}/${tools.length} kept=[${kept}] dropped=[${dropped}]`);
+        }
         combinedSystemPrompt = devSystemPrompt
             ? `${devSystemPrompt}${toolInstructions}`
             : toolInstructions || undefined;
@@ -618,6 +657,9 @@ app.post('/v1/chat/completions', async (req, res) => {
             } else {
                 // Fallback: nothing new to send, use full history as new session
                 logEntry.resumeMethod = 'fallback';
+                // Purge old session — resume found nothing new, starting fresh
+                purgeCliSession(sessionId);
+                if (routingKey) channelMap.delete(routingKey);
                 isResume = false;
                 sessionId = uuidv4();
                 promptText = convertMessages(messages).promptText;
@@ -644,6 +686,17 @@ app.post('/v1/chat/completions', async (req, res) => {
             }
         }
 
+        // Guard: if prompt is too large for new session, compact it
+        if (!isResume && promptText.length > MAX_NEW_SESSION_CHARS) {
+            console.warn(`[${requestId}] Prompt too large (${promptText.length} chars), auto-compacting`);
+            const compactResult = convertMessagesCompact(messages);
+            promptText = compactResult.promptText;
+            if (compactResult.systemPrompt) {
+                combinedSystemPrompt = `${compactResult.systemPrompt}${toolInstructions}`;
+            }
+            console.log(`[${requestId}] Compacted: ${promptText.length} chars`);
+        }
+
         logEntry.promptLen = promptText.length;
         logEntry.cliSessionId = sessionId.slice(0, 8);
         logEntry.resumed = isResume;
@@ -658,6 +711,17 @@ app.post('/v1/chat/completions', async (req, res) => {
             res.setHeader('Connection', 'keep-alive');
             res.setHeader('X-Accel-Buffering', 'no');
             res.flushHeaders();
+            // SSE keepalive: send empty-choices data chunk every 15s to prevent idle timeout
+            keepaliveTimer = setInterval(() => {
+                try {
+                    const heartbeat = JSON.stringify({
+                        id: `chatcmpl-${requestId}`, object: 'chat.completion.chunk',
+                        created: Math.floor(Date.now() / 1000), model,
+                        choices: [],
+                    });
+                    res.write(`data: ${heartbeat}\n\n`);
+                } catch {}
+            }, 15000);
         }
 
         const completionId = `chatcmpl-${requestId}`;
@@ -697,16 +761,30 @@ app.post('/v1/chat/completions', async (req, res) => {
             // OC disconnected (timeout/restart) — not a CLI error, preserve session
             if (isResume && err.message === 'Client disconnected') {
                 console.log(`[${requestId}] OC disconnected, preserving session=${sessionId.slice(0, 8)}`);
+                stats.errors++;
                 logEntry.status = 'oc_disconnect';
                 logEntry.error = err.message;
                 logEntry.durationMs = Date.now() - startTime;
                 return;
+            }
+            // Classify timeout errors
+            if (err.message && err.message.includes('Idle timeout')) {
+                stats.errors++;
+                logEntry.status = 'idle_timeout';
+                logEntry.error = err.message;
+            } else if (err.message && err.message.includes('Hard timeout')) {
+                stats.errors++;
+                logEntry.status = 'hard_timeout';
+                logEntry.error = err.message;
             }
             // CLI failed (context overflow, crash, etc.) — retry with compact history
             if (isResume) {
                 console.warn(`[${requestId}] CLI failed (${err.message}), retrying with compact refresh`);
                 pushActivity(requestId, `⚠ CLI failed, retrying with compact refresh`);
                 logEntry.activity.push(`⚠ CLI failed: ${err.message}`);
+                // Purge the failed CLI session to prevent future resume attempts on broken state
+                purgeCliSession(sessionId);
+                if (routingKey) channelMap.delete(routingKey);
                 isResume = false;
                 sessionId = uuidv4();
                 logEntry.resumeMethod = 'refresh';
@@ -715,12 +793,18 @@ app.post('/v1/chat/completions', async (req, res) => {
                 if (compactResult.systemPrompt) {
                     combinedSystemPrompt = `${compactResult.systemPrompt}${toolInstructions}`;
                 }
+                // If even compact result is too large, truncate hard to prevent infinite loop
+                if (promptText.length > MAX_NEW_SESSION_CHARS) {
+                    console.warn(`[${requestId}] Compact retry still too large (${promptText.length}), truncating`);
+                    promptText = promptText.slice(-MAX_NEW_SESSION_CHARS);
+                }
                 logEntry.promptLen = promptText.length;
                 console.log(`[${requestId}] Compact refresh: new session=${sessionId.slice(0, 8)} promptLen=${promptText.length}`);
                 try {
                     ({ text: finalText, usage: finalUsage } = await runClaude(combinedSystemPrompt, promptText, model, onChunk, ac.signal, reasoning_effort, sessionId, false));
                 } catch (retryErr) {
                     console.error(`[${requestId}] Retry also failed: ${retryErr.message}`);
+                    stats.errors++;
                     logEntry.status = 'error';
                     logEntry.error = retryErr.message;
                     if (isStream) {
@@ -735,7 +819,8 @@ app.post('/v1/chat/completions', async (req, res) => {
                 }
             } else {
                 console.error(`[${requestId}] Claude error: ${err.message}`);
-                logEntry.status = 'error';
+                stats.errors++;
+                logEntry.status = err.message.includes('exited with code') ? 'cli_exit' : 'error';
                 logEntry.error = err.message;
                 if (isStream) {
                     sendChunk(`\n\n[Error: ${err.message}]`);
@@ -754,6 +839,9 @@ app.post('/v1/chat/completions', async (req, res) => {
         logEntry.cacheReadTokens = finalUsage.cache_read_tokens;
         logEntry.outputTokens = finalUsage.output_tokens;
         logEntry.costUsd = finalUsage.cost_usd;
+        // Mark if usage data was actually returned by CLI (vs default zeros)
+        const hasUsage = (finalUsage.input_tokens || 0) + (finalUsage.cache_creation_tokens || 0) + (finalUsage.output_tokens || 0) > 0;
+        logEntry.usageAvailable = hasUsage;
 
         const totalInput = (finalUsage.input_tokens || 0) + (finalUsage.cache_creation_tokens || 0) + (finalUsage.cache_read_tokens || 0);
         const usagePayload = {
@@ -767,7 +855,14 @@ app.post('/v1/chat/completions', async (req, res) => {
         };
 
         // Parse <tool_call> blocks from Claude's response
-        const toolCalls = parseToolCalls(finalText || '');
+        const parsedToolCalls = parseToolCalls(finalText || '');
+        const availableToolNames = getAvailableToolNames(tools);
+        const { valid: toolCalls, invalid: invalidToolCalls } = filterToolCalls(parsedToolCalls, availableToolNames);
+        if (invalidToolCalls.length > 0) {
+            console.warn(`[${requestId}] filtered unavailable tool_calls: [${invalidToolCalls.map(tc => tc.name).join(', ')}]`);
+            pushActivity(requestId, `filtered unavailable tool_calls: [${invalidToolCalls.map(tc => tc.name).join(', ')}]`);
+            logEntry.activity.push(`filtered unavailable tool_calls: [${invalidToolCalls.map(tc => tc.name).join(', ')}]`);
+        }
 
         if (toolCalls.length > 0) {
             // Claude requested tools → return as OpenAI tool_calls for OC to execute
@@ -784,15 +879,9 @@ app.post('/v1/chat/completions', async (req, res) => {
             console.log(`[${requestId}] sessionMap: stored ${toolCalls.length} tool_call_ids for session=${sessionId.slice(0, 8)} (total=${sessionMap.size})`);
 
             if (isStream) {
-                // Send any text before tool calls
-                if (textBeforeTools) {
-                    const textChunk = {
-                        id: completionId, object: 'chat.completion.chunk',
-                        created: Math.floor(Date.now() / 1000), model,
-                        choices: [{ index: 0, delta: { role: 'assistant', content: textBeforeTools }, finish_reason: null }],
-                    };
-                    res.write(`data: ${JSON.stringify(textChunk)}\n\n`);
-                }
+                // Suppress any partial assistant prose before tool calls.
+                // Tool-use turns should only surface the tool_calls payload until
+                // the loop completes and a final verified reply is ready.
 
                 // Send tool_calls delta
                 const tcDelta = {
@@ -832,7 +921,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                     created: Math.floor(Date.now() / 1000), model,
                     choices: [{ index: 0, message: {
                         role: 'assistant',
-                        content: textBeforeTools || null,
+                        content: null,
                         tool_calls: toolCalls.map((tc, i) => ({
                             id: tc.id, index: i, type: 'function',
                             function: { name: tc.name, arguments: JSON.stringify(tc.arguments) },
@@ -909,6 +998,8 @@ app.post('/v1/chat/completions', async (req, res) => {
         if (!res.headersSent) res.status(500).json({ error: { message: err.message, type: 'internal_error' } });
         else res.end();
     } finally {
+        if (keepaliveTimer) clearInterval(keepaliveTimer);
+        if (releaseChannelLock) releaseChannelLock();
         stats.activeRequests = Math.max(0, stats.activeRequests - 1);
         if (acquiredChannel) {
             const cnt = channelActive.get(acquiredChannel) || 0;

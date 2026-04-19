@@ -56,4 +56,16 @@ function buildToolInstructions(tools) {
     return lines.join('\n');
 }
 
-module.exports = { buildToolInstructions };
+/**
+ * Filter tools based on message profile.
+ * Removes gateway-internal tools that should not reach Claude.
+ */
+function filterToolsByProfile(tools, messages) {
+    if (!Array.isArray(tools)) return [];
+    return tools.filter(t => {
+        const name = t.function?.name || t.name;
+        return name && !GATEWAY_BLOCKED.has(name);
+    });
+}
+
+module.exports = { buildToolInstructions, filterToolsByProfile };

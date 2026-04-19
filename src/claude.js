@@ -103,7 +103,6 @@ function mapEffort(reasoningEffort) {
 const SCRUB_PATTERNS = [
     /\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b/g,   // SCREAMING_SNAKE_CASE (2+ segments)
     /\[\[\s*(\w+)\s*\]\]/g,                    // [[bracket_tags]]
-    /\bsessions_[a-z_]+\b/g,                   // sessions_* tool names
 ];
 
 const SCRUB_WHITELIST = new Set([
@@ -238,6 +237,8 @@ function runClaude(systemPrompt, promptText, modelId, onChunk, signal, reasoning
 
         // Always disable native tools (CLI flag, not session property)
         args.push('--tools', '');
+        // Block user MCP servers from leaking into Claude's tool context
+        args.push('--strict-mcp-config');
 
         // Map OC reasoning_effort → Claude CLI --effort
         const effort = mapEffort(reasoningEffort);
@@ -295,6 +296,9 @@ function runClaude(systemPrompt, promptText, modelId, onChunk, signal, reasoning
         let fullText = '';
         let fullUsage = { input_tokens: 0, output_tokens: 0 };
         let buffer = '';
+        // Capture last stderr lines for debugging CLI exit code 1
+        const stderrLines = [];
+        const MAX_STDERR_LINES = 20;
 
         proc.stdout.on('data', (chunk) => {
             resetIdle(); // Claude is alive — reset idle timer
@@ -317,7 +321,11 @@ function runClaude(systemPrompt, promptText, modelId, onChunk, signal, reasoning
 
         proc.stderr.on('data', (data) => {
             const msg = data.toString().trim();
-            if (msg) console.error(`[claude stderr] ${msg}`);
+            if (msg) {
+                console.error(`[claude stderr] ${msg}`);
+                stderrLines.push(msg);
+                if (stderrLines.length > MAX_STDERR_LINES) stderrLines.shift();
+            }
         });
 
         proc.on('close', (code) => {
@@ -335,13 +343,14 @@ function runClaude(systemPrompt, promptText, modelId, onChunk, signal, reasoning
             }
 
             if (code !== 0 && !fullText) {
-                reject(new Error(`Claude exited with code ${code}`));
+                const stderrTail = stderrLines.length > 0 ? ` | stderr: ${stderrLines.slice(-5).join(' | ')}` : '';
+                reject(new Error(`Claude exited with code ${code}${stderrTail}`));
             } else {
                 // Inbound: restore aliases → original tokens
                 if (fullText) {
                     fullText = restoreInbound(fullText, alias, aliasLower, sessionId);
                 }
-                resolve({ text: fullText, usage: fullUsage });
+                resolve({ text: fullText, usage: fullUsage, stderrTail: stderrLines.slice(-5) });
             }
         });
 

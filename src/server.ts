@@ -717,6 +717,18 @@ app.post('/v1/chat/completions', async (req: Request, res: Response) => {
             if (isStream) { res.write(`data: ${JSON.stringify(chunk)}\n\n`); chunksSent++; }
         };
 
+        // Stream reasoning/thinking blocks as OpenAI-compatible reasoning_content deltas
+        const sendReasoningChunk = (text: string) => {
+            const chunk = {
+                id: completionId,
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                model,
+                choices: [{ index: 0, delta: { reasoning_content: text }, finish_reason: null }],
+            };
+            if (isStream) { res.write(`data: ${JSON.stringify(chunk)}\n\n`); }
+        };
+
         const onChunk = (text: string) => {
             const msg = text.trim();
             if (!msg) return;
@@ -725,13 +737,24 @@ app.post('/v1/chat/completions', async (req: Request, res: Response) => {
             pushActivity(requestId, msg);
         };
 
+        // Reasoning callback — stream thinking blocks and log snippets
+        const onReasoning = (text: string) => {
+            sendReasoningChunk(text);
+            const snippet = text.length > 80 ? text.slice(0, 80) + '…' : text;
+            pushActivity(requestId, `🧠 reasoning: ${snippet}`);
+        };
+
+        // Skip reasoning override for models that don't support it (e.g. Haiku)
+        const isReasoningModel = !model.toLowerCase().includes('haiku');
+        const effectiveReasoningEffort = isReasoningModel ? reasoning_effort : undefined;
+
         const ac = new AbortController();
         res.on('close', () => { if (!res.writableFinished) ac.abort(); });
 
         let finalText: string | undefined;
         let finalUsage: { input_tokens: number; cache_creation_tokens: number; cache_read_tokens: number; output_tokens: number; cost_usd: number } = { input_tokens: 0, cache_creation_tokens: 0, cache_read_tokens: 0, output_tokens: 0, cost_usd: 0 };
         try {
-            const result = await runClaude(combinedSystemPrompt, promptText, model, onChunk, ac.signal, reasoning_effort, sessionId, isResume);
+            const result = await runClaude(combinedSystemPrompt, promptText, model, onChunk, ac.signal, effectiveReasoningEffort, sessionId, isResume, onReasoning);
             finalText = result.text;
             finalUsage = { input_tokens: result.usage.input_tokens || 0, cache_creation_tokens: result.usage.cache_creation_tokens || 0, cache_read_tokens: result.usage.cache_read_tokens || 0, output_tokens: result.usage.output_tokens || 0, cost_usd: result.usage.cost_usd || 0 };
         } catch (err: any) {
@@ -776,7 +799,7 @@ app.post('/v1/chat/completions', async (req: Request, res: Response) => {
                 logEntry.promptLen = promptText.length;
                 console.log(`[${requestId}] Compact refresh: new session=${sessionId.slice(0, 8)} promptLen=${promptText.length}`);
                 try {
-                    const retryResult = await runClaude(combinedSystemPrompt, promptText, model, onChunk, ac.signal, reasoning_effort, sessionId, false);
+                    const retryResult = await runClaude(combinedSystemPrompt, promptText, model, onChunk, ac.signal, effectiveReasoningEffort, sessionId, false, onReasoning);
                     finalText = retryResult.text;
                     finalUsage = { input_tokens: retryResult.usage.input_tokens || 0, cache_creation_tokens: retryResult.usage.cache_creation_tokens || 0, cache_read_tokens: retryResult.usage.cache_read_tokens || 0, output_tokens: retryResult.usage.output_tokens || 0, cost_usd: retryResult.usage.cost_usd || 0 };
                 } catch (retryErr: any) {

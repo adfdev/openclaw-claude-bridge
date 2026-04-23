@@ -89,6 +89,7 @@ function mapEffort(reasoningEffort?: string): string | null {
 const SCRUB_PATTERNS: RegExp[] = [
     /\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b/g,   // SCREAMING_SNAKE_CASE (2+ segments)
     /\[\[\s*(\w+)\s*\]\]/g,                    // [[bracket_tags]]
+    /\bsessions_[a-z_]+\b/g,                   // sessions_* tool names
 ];
 
 const SCRUB_WHITELIST = new Set([
@@ -190,6 +191,7 @@ export function runClaude(
     reasoningEffort: string | undefined,
     sessionId: string,
     isResume: boolean,
+    onReasoning?: (text: string) => void,
 ): Promise<ClaudeResult> {
     const { alias, aliasLower } = getSessionAlias(sessionId);
     if (systemPrompt) {
@@ -289,7 +291,7 @@ export function runClaude(
 
                 try {
                     const event = JSON.parse(trimmed);
-                    handleEvent(event, onChunk, (text) => { fullText = text; }, (u) => { fullUsage = u; });
+                    handleEvent(event, onChunk, (text) => { fullText = text; }, (u) => { fullUsage = u; }, onReasoning);
                 } catch {
                     // Non-JSON line, ignore
                 }
@@ -314,7 +316,7 @@ export function runClaude(
             if (buffer.trim()) {
                 try {
                     const event = JSON.parse(buffer.trim());
-                    handleEvent(event, onChunk, (text) => { fullText = text; }, (u) => { fullUsage = u; });
+                    handleEvent(event, onChunk, (text) => { fullText = text; }, (u) => { fullUsage = u; }, onReasoning);
                 } catch {}
             }
 
@@ -351,12 +353,28 @@ interface StreamEvent {
     total_cost_usd?: number;
 }
 
+/**
+ * When onReasoning is provided, we stream intermediate `thinking`
+ * blocks from assistant events so OpenClaw can surface reasoning
+ * previews in channels like Telegram/Discord.
+ */
 function handleEvent(
     event: StreamEvent,
     onChunk: (text: string) => void,
     setFull: (text: string) => void,
     setUsage: (usage: ClaudeUsage) => void,
+    onReasoning?: (text: string) => void,
 ): void {
+    // Stream thinking blocks from assistant turns as reasoning deltas.
+    if (event.type === 'assistant' && (event as any).message && Array.isArray((event as any).message.content)) {
+        if (typeof onReasoning === 'function') {
+            for (const block of (event as any).message.content) {
+                if (block && block.type === 'thinking' && typeof block.thinking === 'string' && block.thinking) {
+                    onReasoning(block.thinking);
+                }
+            }
+        }
+    }
     if (event.type === 'result') {
         const result = event.result;
         if (typeof result === 'string' && result) {

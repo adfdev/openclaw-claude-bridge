@@ -31,6 +31,10 @@ Improvements integrated from community forks (Kyzcreig, Patinado, ymat19):
 ### Security
 - **`--strict-mcp-config`** — blocks host MCP servers from leaking into the bridge session, preventing context pollution and reducing token usage
 
+### Reasoning
+- **Reasoning streaming** — Claude's `thinking` blocks are streamed as `reasoning_content` SSE deltas in OpenAI-compatible format, so OpenClaw can surface reasoning previews in real time on Discord/Telegram
+- **Per-model reasoning skip** — models that don't support extended thinking (e.g. Haiku) automatically skip the `reasoning_effort` override, preventing silent CLI errors
+
 ### Diagnostics
 - **Stderr capture** — captures the last 20 stderr lines from Claude CLI for better diagnostics on exit code failures
 - **Error classification** — separate statuses for `idle_timeout`, `hard_timeout`, `cli_exit`, and `oc_disconnect` instead of generic "error"
@@ -152,6 +156,10 @@ The bridge supports Claude's extended thinking via the `reasoning_effort` parame
 | `high` / `xhigh` | `high` | Deep step-by-step |
 
 When `reasoning_effort` is not provided, thinking is disabled entirely (`MAX_THINKING_TOKENS=0`).
+
+Models that don't support thinking (e.g. Haiku) automatically skip the reasoning effort override.
+
+When thinking is active, the bridge streams Claude's `thinking` blocks as `reasoning_content` SSE deltas in OpenAI-compatible format — so OpenClaw can show reasoning previews in real time on channels like Discord and Telegram.
 
 ### Error Recovery
 

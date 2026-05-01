@@ -857,12 +857,18 @@ app.post('/v1/chat/completions', async (req, res) => {
         // Parse <tool_call> blocks from Claude's response
         const parsedToolCalls = parseToolCalls(finalText || '');
         const availableToolNames = getAvailableToolNames(tools);
-        const { valid: toolCalls, invalid: invalidToolCalls } = filterToolCalls(parsedToolCalls, availableToolNames);
+        const { invalid: invalidToolCalls } = filterToolCalls(parsedToolCalls, availableToolNames);
         if (invalidToolCalls.length > 0) {
-            console.warn(`[${requestId}] filtered unavailable tool_calls: [${invalidToolCalls.map(tc => tc.name).join(', ')}]`);
-            pushActivity(requestId, `filtered unavailable tool_calls: [${invalidToolCalls.map(tc => tc.name).join(', ')}]`);
-            logEntry.activity.push(`filtered unavailable tool_calls: [${invalidToolCalls.map(tc => tc.name).join(', ')}]`);
+            // Forward invalid tool_calls instead of dropping them: the orchestrator will
+            // surface tool_not_found and the model can self-correct on the next turn.
+            // Dropping silently caused empty responses when the model hallucinated names
+            // (e.g. "discord" instead of "message"), losing the user-facing message.
+            const names = invalidToolCalls.map(tc => tc.name).join(', ');
+            console.warn(`[${requestId}] forwarding unknown tool_calls (will surface as tool_not_found): [${names}]`);
+            pushActivity(requestId, `forwarding unknown tool_calls: [${names}]`);
+            logEntry.activity.push(`forwarding unknown tool_calls: [${names}]`);
         }
+        const toolCalls = parsedToolCalls;
 
         if (toolCalls.length > 0) {
             // Claude requested tools → return as OpenAI tool_calls for OC to execute
